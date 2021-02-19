@@ -63,11 +63,14 @@ func New(settings map[string]string, _ json.RawMessage) (providers.DNSServicePro
 	return api, nil
 }
 
-func toHostingdeRecord(r models.RecordConfig) *hostingdeModel.RecordObject {
+func toHostingdeRecord(r models.RecordConfig, originalID string) *hostingdeModel.RecordObject {
 	ro := &hostingdeModel.RecordObject{
 		Name: r.NameFQDN,
 		Type: r.Type,
 		TTL:  int(r.TTL),
+	}
+	if len(originalID) > 0 {
+		ro.ID = originalID
 	}
 
 	if r.Type == "SRV" {
@@ -78,6 +81,10 @@ func toHostingdeRecord(r models.RecordConfig) *hostingdeModel.RecordObject {
 	} else if r.Type == "CAA" {
 		flag := strconv.Itoa(int(r.CaaFlag))
 		ro.Content = flag + " " + r.Target
+	} else if r.Type == "NS" || r.Type == "MX" || r.Type == "CNAME" || r.Type == "ALIAS" {
+		ro.Priority = int(r.MxPreference)
+		length := len(r.Target)
+		ro.Content = r.Target[:length-1]
 	} else {
 		ro.Priority = int(r.MxPreference)
 		ro.Content = r.Target
@@ -159,6 +166,9 @@ func (api *hostingdeProvider) GetZoneRecords(domain string) (models.Records, err
 
 	dcRecords := make([]*models.RecordConfig, len(zone.Records))
 	for i := range zone.Records {
+		if zone.Records[i].Type == "NS" || zone.Records[i].Type == "MX" || zone.Records[i].Type == "CNAME" || zone.Records[i].Type == "ALIAS" {
+			zone.Records[i].Content = zone.Records[i].Content + "."
+		}
 		dcRecords[i] = toDNSControlRecord(domain, zone.Records[i])
 	}
 	return dcRecords, nil
@@ -198,6 +208,7 @@ func (api *hostingdeProvider) GetDomainCorrections(dc *models.DomainConfig) ([]*
 
 	// Normalize
 	models.PostProcessRecords(existingRecords)
+
 	differ := diff.New(dc)
 	_, create, del, modify, err := differ.IncrementalDiff(existingRecords)
 	if err != nil {
@@ -206,44 +217,49 @@ func (api *hostingdeProvider) GetDomainCorrections(dc *models.DomainConfig) ([]*
 
 	var recordsToAdd []hostingdeModel.RecordObject
 	for _, object := range create {
-		record := object.Existing.Original.(*hostingdeModel.RecordObject)
-		recordsToAdd = append(recordsToAdd, *record)
+		if object.Desired.Type != "SOA" {
+			record := toHostingdeRecord(*object.Desired, "")
+			recordsToAdd = append(recordsToAdd, *record)
+		}
 	}
-
 	var recordsToModify []hostingdeModel.RecordObject
 	for _, object := range modify {
-		record := object.Existing.Original.(*hostingdeModel.RecordObject)
-		recordsToModify = append(recordsToModify, *record)
+		if object.Desired.Type != "SOA" {
+			originalRecord := object.Existing.Original.(hostingdeModel.RecordObject)
+			record := toHostingdeRecord(*object.Desired, originalRecord.ID)
+			recordsToModify = append(recordsToModify, *record)
+		}
 	}
-
 	var recordsToDelete []hostingdeModel.RecordObject
 	for _, object := range del {
-		record := object.Existing.Original.(*hostingdeModel.RecordObject)
-		recordsToDelete = append(recordsToDelete, *record)
+		if object.Existing.Type != "SOA" {
+			originalRecord := object.Existing.Original.(hostingdeModel.RecordObject)
+			record := toHostingdeRecord(*object.Existing, originalRecord.ID)
+			recordsToDelete = append(recordsToDelete, *record)
+		}
 	}
 
 	var corrections []*models.Correction
 
 	// only create corrections if there are changes
-	msg := fmt.Sprintf("Updating Zone")
 	if cap(recordsToAdd) > 0 || cap(recordsToModify) > 0 || cap(recordsToDelete) > 0 {
-		corrections = append(corrections,
-			&models.Correction{
-				Msg: msg,
-				F: func() error {
-					zoneConfig, err := api.GetZoneConfig(domain)
-					if err != nil {
-						return err
-					}
-					var updateRequest hostingdeClient.ZoneUpdateRequest
-					updateRequest.ZoneConfig = *zoneConfig
-					updateRequest.RecordsToAdd = recordsToAdd
-					updateRequest.RecordsToModify = recordsToModify
-					updateRequest.RecordsToDelete = recordsToDelete
-					_, err = api.Client.Dns.ZoneUpdate(updateRequest)
+		correction := &models.Correction{
+			Msg: fmt.Sprintf("Updating Zone"),
+			F: func() error {
+				zoneConfig, err := api.GetZoneConfig(domain)
+				if err != nil {
 					return err
-				},
-			})
+				}
+				var updateRequest hostingdeClient.ZoneUpdateRequest
+				updateRequest.ZoneConfig = *zoneConfig
+				updateRequest.RecordsToAdd = recordsToAdd
+				updateRequest.RecordsToModify = recordsToModify
+				updateRequest.RecordsToDelete = recordsToDelete
+				_, err = api.Client.Dns.ZoneUpdate(updateRequest)
+				return err
+			},
+		}
+		corrections = append(corrections, correction)
 	}
 
 	return corrections, nil
