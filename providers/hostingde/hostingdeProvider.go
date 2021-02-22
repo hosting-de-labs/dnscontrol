@@ -20,16 +20,18 @@ type hostingdeProvider struct {
 }
 
 var features = providers.DocumentationNotes{
-	providers.DocCreateDomains:       providers.Cannot(),
-	providers.DocDualHost:            providers.Cannot(),
+	providers.DocCreateDomains:       providers.Cannot("This feature will be implemented in the future."),
+	providers.DocDualHost:            providers.Can(),
 	providers.DocOfficiallySupported: providers.Cannot(),
-	providers.CanUseTXTMulti:         providers.Can(),
+	providers.CanUseTXTMulti:         providers.Cannot(),
 	providers.CanGetZones:            providers.Can(),
 	providers.CanUseAlias:            providers.Can(),
 	providers.CanUseCAA:              providers.Can(),
 	providers.CanUsePTR:              providers.Can(),
+	providers.CanUseSSHFP:            providers.Can(),
 	providers.CanUseSRV:              providers.Can(),
 	providers.CanUseTLSA:             providers.Can(),
+	providers.CanAutoDNSSEC:          providers.Cannot("This feature will be implemented in the future."),
 	providers.CantUseNOPURGE:         providers.Cannot(),
 }
 
@@ -63,6 +65,14 @@ func New(settings map[string]string, _ json.RawMessage) (providers.DNSServicePro
 	return api, nil
 }
 
+func getErrors(r *hostingdeClient.ZoneResponse) string {
+	var errors string
+	for _, err := range r.Errors {
+		errors = fmt.Sprintf("%s\n%d: %s", errors, err.Code, err.Text)
+	}
+	return errors
+}
+
 func toHostingdeRecord(r models.RecordConfig, originalID string) *hostingdeModel.RecordObject {
 	ro := &hostingdeModel.RecordObject{
 		Name: r.NameFQDN,
@@ -81,12 +91,14 @@ func toHostingdeRecord(r models.RecordConfig, originalID string) *hostingdeModel
 	} else if r.Type == "CAA" {
 		flag := strconv.Itoa(int(r.CaaFlag))
 		ro.Content = flag + " " + r.Target
-	} else if r.Type == "NS" || r.Type == "MX" || r.Type == "CNAME" || r.Type == "ALIAS" {
+	} else if r.Type == "NS" || r.Type == "CNAME" || r.Type == "ALIAS" {
+		length := len(r.Target)
+		ro.Content = r.Target[:length-1]
+	} else if r.Type == "MX" {
 		ro.Priority = int(r.MxPreference)
 		length := len(r.Target)
 		ro.Content = r.Target[:length-1]
 	} else {
-		ro.Priority = int(r.MxPreference)
 		ro.Content = r.Target
 	}
 	return ro
@@ -255,7 +267,10 @@ func (api *hostingdeProvider) GetDomainCorrections(dc *models.DomainConfig) ([]*
 				updateRequest.RecordsToAdd = recordsToAdd
 				updateRequest.RecordsToModify = recordsToModify
 				updateRequest.RecordsToDelete = recordsToDelete
-				_, err = api.Client.Dns.ZoneUpdate(updateRequest)
+				zoneResponse, err := api.Client.Dns.ZoneUpdate(updateRequest)
+				if cap(zoneResponse.Errors) > 0 {
+					err = errors.New(getErrors(zoneResponse))
+				}
 				return err
 			},
 		}
