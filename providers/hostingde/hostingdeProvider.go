@@ -23,7 +23,7 @@ var features = providers.DocumentationNotes{
 	providers.DocCreateDomains:       providers.Cannot("This feature will be implemented in the future."),
 	providers.DocDualHost:            providers.Can(),
 	providers.DocOfficiallySupported: providers.Cannot(),
-	providers.CanUseTXTMulti:         providers.Cannot(),
+	providers.CanUseTXTMulti:         providers.Can(),
 	providers.CanGetZones:            providers.Can(),
 	providers.CanUseAlias:            providers.Can(),
 	providers.CanUseCAA:              providers.Can(),
@@ -89,8 +89,8 @@ func toHostingdeRecord(r models.RecordConfig, originalID string) *hostingdeModel
 		port := strconv.Itoa(int(r.SrvPort))
 		ro.Content = weight + " " + port + " " + r.Target
 	} else if r.Type == "CAA" {
-		flag := strconv.Itoa(int(r.CaaFlag))
-		ro.Content = flag + " " + r.Target
+		caaFlag := strconv.Itoa(int(r.CaaFlag))
+		ro.Content = caaFlag + " " + r.CaaTag + " \"" + r.Target + "\""
 	} else if r.Type == "NS" || r.Type == "CNAME" || r.Type == "ALIAS" {
 		length := len(r.Target)
 		ro.Content = r.Target[:length-1]
@@ -98,6 +98,10 @@ func toHostingdeRecord(r models.RecordConfig, originalID string) *hostingdeModel
 		ro.Priority = int(r.MxPreference)
 		length := len(r.Target)
 		ro.Content = r.Target[:length-1]
+	} else if r.Type == "TXT" {
+		for _, target := range r.TxtStrings {
+			ro.Content = ro.Content + " \"" + target + "\""
+		}
 	} else {
 		ro.Content = r.Target
 	}
@@ -131,6 +135,14 @@ func toDNSControlRecord(domain string, r hostingdeModel.RecordObject) *models.Re
 		rc.CaaFlag = uint8(caaFlag)
 		rc.CaaTag = parts[1]
 		_ = rc.SetTarget(strings.Trim(parts[2], "\""))
+	} else if r.Type == "TXT" {
+		var newParts []string
+		originalParts := strings.Split(r.Content, " ")
+		for _, originalPart := range originalParts {
+			length := len(originalPart)
+			newParts = append(newParts, originalPart[1:length-1])
+		}
+		_ = rc.SetTargetTXTs(newParts)
 	} else {
 		_ = rc.SetTarget(r.Content)
 	}
@@ -204,11 +216,6 @@ func (api *hostingdeProvider) GetNameservers(domain string) ([]*models.Nameserve
 
 // GetDomainCorrections returns the corrections for a domain.
 func (api *hostingdeProvider) GetDomainCorrections(dc *models.DomainConfig) ([]*models.Correction, error) {
-	dc, err := dc.Copy()
-	if err != nil {
-		return nil, err
-	}
-
 	dc.Punycode()
 	domain := dc.Name
 
@@ -227,9 +234,11 @@ func (api *hostingdeProvider) GetDomainCorrections(dc *models.DomainConfig) ([]*
 		return nil, err
 	}
 
+	message := "Updating " + domain
 	var recordsToAdd []hostingdeModel.RecordObject
 	for _, object := range create {
 		if object.Desired.Type != "SOA" {
+			message = message + "\n" + object.String()
 			record := toHostingdeRecord(*object.Desired, "")
 			recordsToAdd = append(recordsToAdd, *record)
 		}
@@ -237,6 +246,7 @@ func (api *hostingdeProvider) GetDomainCorrections(dc *models.DomainConfig) ([]*
 	var recordsToModify []hostingdeModel.RecordObject
 	for _, object := range modify {
 		if object.Desired.Type != "SOA" {
+			message = message + "\n" + object.String()
 			originalRecord := object.Existing.Original.(hostingdeModel.RecordObject)
 			record := toHostingdeRecord(*object.Desired, originalRecord.ID)
 			recordsToModify = append(recordsToModify, *record)
@@ -245,6 +255,7 @@ func (api *hostingdeProvider) GetDomainCorrections(dc *models.DomainConfig) ([]*
 	var recordsToDelete []hostingdeModel.RecordObject
 	for _, object := range del {
 		if object.Existing.Type != "SOA" {
+			message = message + "\n" + object.String()
 			originalRecord := object.Existing.Original.(hostingdeModel.RecordObject)
 			record := toHostingdeRecord(*object.Existing, originalRecord.ID)
 			recordsToDelete = append(recordsToDelete, *record)
@@ -256,7 +267,7 @@ func (api *hostingdeProvider) GetDomainCorrections(dc *models.DomainConfig) ([]*
 	// only create corrections if there are changes
 	if cap(recordsToAdd) > 0 || cap(recordsToModify) > 0 || cap(recordsToDelete) > 0 {
 		correction := &models.Correction{
-			Msg: fmt.Sprintf("Updating Zone"),
+			Msg: message,
 			F: func() error {
 				zoneConfig, err := api.GetZoneConfig(domain)
 				if err != nil {
